@@ -10,19 +10,17 @@
 from __future__ import print_function
 
 import getpass
+import inspect
 import logging
 import os
 import sys
+import traceback
 from errno import EACCES, EINVAL, EOPNOTSUPP
 from stat import *
 
 from ansible_vault import Vault
 
-logging.basicConfig(filename="ansiblefs.log", level=logging.DEBUG)
-
-
-import inspect
-import traceback
+logging.basicConfig(filename="ansiblefs.log", level=logging.WARNING)
 
 
 def my_handler(type, value, tb):
@@ -59,7 +57,7 @@ def flag2mode(flags):
     md = {os.O_RDONLY: "rb", os.O_WRONLY: "wb", os.O_RDWR: "wb+"}
     m = md[flags & (os.O_RDONLY | os.O_WRONLY | os.O_RDWR)]
 
-    if flags | os.O_APPEND:
+    if flags & os.O_APPEND:
         m = m.replace("w", "a", 1)
 
     return m
@@ -150,8 +148,6 @@ class AnsibleFS(Fuse):
             self.mode = mode
             self.path = path
             self.file_path = "." + path
-            if "a" in flag2mode(flags):
-                flags = flags | os.O_APPEND | os.O_WRONLY
             logging.debug(
                 "# New file object %s %s %s %s", path, flags, *mode, flag2mode(flags)
             )
@@ -168,18 +164,14 @@ class AnsibleFS(Fuse):
                 end = offset + length
             else:
                 end = None
-            try:
-                self.file.seek(0)
-                encrypted = self.file.read()
-                self.file.seek(0)
-                logging.debug("Read encrypted: %s…", encrypted[:10])
-                content = self.vault.load_raw(encrypted)
-                logging.debug("Read raw: %s…", content[:10])
-                return content[slice(offset, end)]
-            except Exception as e:
-                return str(e).encode()
+            self.file.seek(0)
+            encrypted = self.file.read()
+            self.file.seek(0)
+            logging.debug("Read encrypted: %s…", encrypted[:10])
+            content = self.vault.load_raw(encrypted)
+            logging.debug("Read raw: %s…", content[:10])
+            return content[slice(offset, end)]
 
-        # TODO
         def write(self, buf, offset):
             try:
                 logging.debug(
@@ -190,20 +182,27 @@ class AnsibleFS(Fuse):
                     self.flags,
                     flag2mode(self.flags),
                 )
+                if "a" in self.file.mode:
+                    flags = (self.flags - os.O_APPEND) & ~os.O_WRONLY | os.O_RDWR
+                    mode = flag2mode(flags)
+                    f = os.open(self.file_path, flags)
+                    file = os.fdopen(f, mode)
+                    self.file.close()
+                    self.file = file
+
                 if offset != 0:
-                    ro = self.__class__(self.path, 1024, 1024)
-                    old = ro.read(None, 0)
-                    # old = b"test123"
-                    logging.debug(" old content: %s", old)
+                    old_plaintext = self.read(None, 0)
+                    logging.debug(" old content: %s", old_plaintext)
                 else:
-                    old = b""
-                new = old + buf
-                logging.debug(" new content: %s", new)
-                encrypted = self.vault.dump_raw(new).encode()
-                logging.debug(" new encrypted: %s", encrypted)
-                logging.debug("end write")
+                    old_plaintext = b""
+                new_plaintext = old_plaintext + buf
+                logging.debug(" new content: %s", new_plaintext)
+                encrypted = self.vault.dump_raw(new_plaintext).encode()
+                logging.debug(" new encrypted: %s…", encrypted[0:50])
                 self.file.seek(0)
-                return self.file.write(encrypted)
+                rc = self.file.write(encrypted)
+                logging.debug("end write rc: %s", rc)
+                return len(buf)
             except Exception as e:
                 logging.error(e)
 
@@ -231,6 +230,7 @@ class AnsibleFS(Fuse):
 
         # TODO
         def ftruncate(self, length):
+            logging.debug("ftruncate")
             logging.debug(inspect.currentframe())
             self.file.truncate(length)
 
